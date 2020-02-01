@@ -1,202 +1,230 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
-# modified by sailfish009
-r"""
-Basic training script for PyTorch
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+"""
+Detectron2 training script with a plain training loop.
+
+This scripts reads a given config file and runs the training or evaluation.
+It is an entry point that is able to train standard models in mydl.
+
+In order to let one script support training of many models,
+this script contains logic that are specific to these built-in models and therefore
+may not be suitable for your own project.
+For example, your research project perhaps only needs a single "evaluator".
+
+Therefore, we recommend you to use mydl as an library and take
+this file as an example of how to use the library.
+You may want to write your own script with your datasets and other customizations.
+
+Compared to "train_net.py", this script supports fewer default features.
+It also includes fewer abstraction, therefore is easier to add custom logic.
 """
 
-# Set up custom environment before nearly anything else is imported
-# NOTE: this should be the first import (no not reorder)
-from mydl.utils.env import setup_environment  # noqa F401 isort:skip
-
-import argparse
+import logging
 import os
-
+from collections import OrderedDict
 import torch
-from mydl.config import cfg
-from mydl.data import make_data_loader
-from mydl.solver import make_lr_scheduler
-from mydl.solver import make_optimizer
-from mydl.engine.inference import inference
-from mydl.engine.trainer import do_train
-from mydl.modeling.detector import build_detection_model
-from mydl.utils.checkpoint import DetectronCheckpointer
-from mydl.utils.collect_env import collect_env_info
-from mydl.utils.comm import synchronize, get_rank
-from mydl.utils.imports import import_file
-from mydl.utils.logger import setup_logger
-from mydl.utils.miscellaneous import mkdir, save_config
+from torch.nn.parallel import DistributedDataParallel
 
-# See if we can use apex.DistributedDataParallel instead of the torch default,
-# and enable mixed-precision via apex.amp
-try:
-    from apex import amp
-except ImportError:
-    raise ImportError('Use APEX for multi-precision via apex.amp')
+import mydl.utils.comm as comm
+from mydl.checkpoint import DetectionCheckpointer, PeriodicCheckpointer
+from mydl.config import get_cfg
+from mydl.data import (
+    MetadataCatalog,
+    build_detection_test_loader,
+    build_detection_train_loader,
+)
+from mydl.engine import default_argument_parser, default_setup, launch
+from mydl.evaluation import (
+    CityscapesEvaluator,
+    COCOEvaluator,
+    COCOPanopticEvaluator,
+    DatasetEvaluators,
+    LVISEvaluator,
+    PascalVOCDetectionEvaluator,
+    SemSegEvaluator,
+    inference_on_dataset,
+    print_csv_format,
+)
+from mydl.modeling import build_model
+from mydl.solver import build_lr_scheduler, build_optimizer
+from mydl.utils.events import (
+    CommonMetricPrinter,
+    EventStorage,
+    JSONWriter,
+    TensorboardXWriter,
+)
+
+logger = logging.getLogger("mydl")
 
 
-def train(cfg, local_rank, distributed):
-    model = build_detection_model(cfg)
-    device = torch.device(cfg.MODEL.DEVICE)
-    model.to(device)
-
-    optimizer = make_optimizer(cfg, model)
-    scheduler = make_lr_scheduler(cfg, optimizer)
-
-    # Initialize mixed-precision training
-    use_mixed_precision = cfg.DTYPE == "float16"
-    amp_opt_level = 'O1' if use_mixed_precision else 'O0'
-    model, optimizer = amp.initialize(model, optimizer, opt_level=amp_opt_level)
-
-    if distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank,
-            # this should be removed if we update BatchNorm stats
-            broadcast_buffers=False,
+def get_evaluator(cfg, dataset_name, output_folder=None):
+    """
+    Create evaluator(s) for a given dataset.
+    This uses the special metadata "evaluator_type" associated with each builtin dataset.
+    For your own dataset, you can simply create an evaluator manually in your
+    script and do not have to worry about the hacky if-else logic here.
+    """
+    if output_folder is None:
+        output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
+    evaluator_list = []
+    evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
+    if evaluator_type in ["sem_seg", "coco_panoptic_seg"]:
+        evaluator_list.append(
+            SemSegEvaluator(
+                dataset_name,
+                distributed=True,
+                num_classes=cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
+                ignore_label=cfg.MODEL.SEM_SEG_HEAD.IGNORE_VALUE,
+                output_dir=output_folder,
+            )
         )
-
-    arguments = {}
-    arguments["iteration"] = 0
-
-    output_dir = cfg.OUTPUT_DIR
-
-    save_to_disk = get_rank() == 0
-    checkpointer = DetectronCheckpointer(
-        cfg, model, optimizer, scheduler, output_dir, save_to_disk
-    )
-    extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT)
-    arguments.update(extra_checkpoint_data)
-
-    data_loader = make_data_loader(
-        cfg,
-        is_train=True,
-        is_distributed=distributed,
-        start_iter=arguments["iteration"],
-    )
-
-    test_period = cfg.SOLVER.TEST_PERIOD
-    if test_period > 0:
-        data_loader_val = make_data_loader(cfg, is_train=False, is_distributed=distributed, is_for_period=True)
-    else:
-        data_loader_val = None
-
-    checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
-
-    do_train(
-        cfg,
-        model,
-        data_loader,
-        data_loader_val,
-        optimizer,
-        scheduler,
-        checkpointer,
-        device,
-        checkpoint_period,
-        test_period,
-        arguments,
-    )
-
-    return model
-
-
-def run_test(cfg, model, distributed):
-    if distributed:
-        model = model.module
-    torch.cuda.empty_cache()  # TODO check if it helps
-    iou_types = ("bbox",)
-    if cfg.MODEL.MASK_ON:
-        iou_types = iou_types + ("segm",)
-    if cfg.MODEL.KEYPOINT_ON:
-        iou_types = iou_types + ("keypoints",)
-    output_folders = [None] * len(cfg.DATASETS.TEST)
-    dataset_names = cfg.DATASETS.TEST
-    if cfg.OUTPUT_DIR:
-        for idx, dataset_name in enumerate(dataset_names):
-            output_folder = os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
-            mkdir(output_folder)
-            output_folders[idx] = output_folder
-    data_loaders_val = make_data_loader(cfg, is_train=False, is_distributed=distributed)
-    for output_folder, dataset_name, data_loader_val in zip(output_folders, dataset_names, data_loaders_val):
-        inference(
-            model,
-            data_loader_val,
-            dataset_name=dataset_name,
-            iou_types=iou_types,
-            box_only=False if cfg.MODEL.RETINANET_ON else cfg.MODEL.RPN_ONLY,
-            bbox_aug=cfg.TEST.BBOX_AUG.ENABLED,
-            device=cfg.MODEL.DEVICE,
-            expected_results=cfg.TEST.EXPECTED_RESULTS,
-            expected_results_sigma_tol=cfg.TEST.EXPECTED_RESULTS_SIGMA_TOL,
-            output_folder=output_folder,
+    if evaluator_type in ["coco", "coco_panoptic_seg"]:
+        evaluator_list.append(COCOEvaluator(dataset_name, cfg, True, output_folder))
+    if evaluator_type == "coco_panoptic_seg":
+        evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
+    if evaluator_type == "cityscapes":
+        assert (
+            torch.cuda.device_count() >= comm.get_rank()
+        ), "CityscapesEvaluator currently do not work with multiple machines."
+        return CityscapesEvaluator(dataset_name)
+    if evaluator_type == "pascal_voc":
+        return PascalVOCDetectionEvaluator(dataset_name)
+    if evaluator_type == "lvis":
+        return LVISEvaluator(dataset_name, cfg, True, output_folder)
+    if len(evaluator_list) == 0:
+        raise NotImplementedError(
+            "no Evaluator for the dataset {} with the type {}".format(dataset_name, evaluator_type)
         )
-        synchronize()
+    if len(evaluator_list) == 1:
+        return evaluator_list[0]
+    return DatasetEvaluators(evaluator_list)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="PyTorch Object Detection Training")
-    parser.add_argument(
-        "--config-file",
-        default="",
-        metavar="FILE",
-        help="path to config file",
-        type=str,
-    )
-    parser.add_argument("--local_rank", type=int, default=0)
-    parser.add_argument(
-        "--skip-test",
-        dest="skip_test",
-        help="Do not test the final model",
-        action="store_true",
-    )
-    parser.add_argument(
-        "opts",
-        help="Modify config options using the command-line",
-        default=None,
-        nargs=argparse.REMAINDER,
-    )
-
-    args = parser.parse_args()
-
-    num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
-    args.distributed = num_gpus > 1
-
-    if args.distributed:
-        torch.cuda.set_device(args.local_rank)
-        torch.distributed.init_process_group(
-            backend="nccl", init_method="env://"
+def do_test(cfg, model):
+    results = OrderedDict()
+    for dataset_name in cfg.DATASETS.TEST:
+        data_loader = build_detection_test_loader(cfg, dataset_name)
+        evaluator = get_evaluator(
+            cfg, dataset_name, os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
         )
-        synchronize()
+        results_i = inference_on_dataset(model, data_loader, evaluator)
+        results[dataset_name] = results_i
+        if comm.is_main_process():
+            logger.info("Evaluation results for {} in csv format:".format(dataset_name))
+            print_csv_format(results_i)
+    if len(results) == 1:
+        results = list(results.values())[0]
+    return results
 
+
+def do_train(cfg, model, resume=False):
+    model.train()
+    optimizer = build_optimizer(cfg, model)
+    scheduler = build_lr_scheduler(cfg, optimizer)
+
+    checkpointer = DetectionCheckpointer(
+        model, cfg.OUTPUT_DIR, optimizer=optimizer, scheduler=scheduler
+    )
+    start_iter = (
+        checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
+    )
+    max_iter = cfg.SOLVER.MAX_ITER
+
+    periodic_checkpointer = PeriodicCheckpointer(
+        checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD, max_iter=max_iter
+    )
+
+    writers = (
+        [
+            CommonMetricPrinter(max_iter),
+            JSONWriter(os.path.join(cfg.OUTPUT_DIR, "metrics.json")),
+            TensorboardXWriter(cfg.OUTPUT_DIR),
+        ]
+        if comm.is_main_process()
+        else []
+    )
+
+    # compared to "train_net.py", we do not support accurate timing and
+    # precise BN here, because they are not trivial to implement
+    data_loader = build_detection_train_loader(cfg)
+    logger.info("Starting training from iteration {}".format(start_iter))
+    with EventStorage(start_iter) as storage:
+        for data, iteration in zip(data_loader, range(start_iter, max_iter)):
+            iteration = iteration + 1
+            storage.step()
+
+            loss_dict = model(data)
+            losses = sum(loss for loss in loss_dict.values())
+            assert torch.isfinite(losses).all(), loss_dict
+
+            loss_dict_reduced = {k: v.item() for k, v in comm.reduce_dict(loss_dict).items()}
+            losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+            if comm.is_main_process():
+                storage.put_scalars(total_loss=losses_reduced, **loss_dict_reduced)
+
+            optimizer.zero_grad()
+            losses.backward()
+            optimizer.step()
+            storage.put_scalar("lr", optimizer.param_groups[0]["lr"], smoothing_hint=False)
+            scheduler.step()
+
+            if (
+                cfg.TEST.EVAL_PERIOD > 0
+                and iteration % cfg.TEST.EVAL_PERIOD == 0
+                and iteration != max_iter
+            ):
+                do_test(cfg, model)
+                # Compared to "train_net.py", the test results are not dumped to EventStorage
+                comm.synchronize()
+
+            if iteration - start_iter > 5 and (iteration % 20 == 0 or iteration == max_iter):
+                for writer in writers:
+                    writer.write()
+            periodic_checkpointer.step(iteration)
+
+
+def setup(args):
+    """
+    Create configs and perform basic setups.
+    """
+    cfg = get_cfg()
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
+    default_setup(
+        cfg, args
+    )  # if you don't like any of the default setup, write your own setup code
+    return cfg
 
-    output_dir = cfg.OUTPUT_DIR
-    if output_dir:
-        mkdir(output_dir)
 
-    logger = setup_logger("sample", output_dir, get_rank())
-    logger.info("Using {} GPUs".format(num_gpus))
-    logger.info(args)
+def main(args):
+    cfg = setup(args)
 
-    logger.info("Collecting env info (might take some time)")
-    logger.info("\n" + collect_env_info())
+    model = build_model(cfg)
+    logger.info("Model:\n{}".format(model))
+    if args.eval_only:
+        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+            cfg.MODEL.WEIGHTS, resume=args.resume
+        )
+        return do_test(cfg, model)
 
-    logger.info("Loaded configuration file {}".format(args.config_file))
-    with open(args.config_file, "r") as cf:
-        config_str = "\n" + cf.read()
-        logger.info(config_str)
-    logger.info("Running with config:\n{}".format(cfg))
+    distributed = comm.get_world_size() > 1
+    if distributed:
+        model = DistributedDataParallel(
+            model, device_ids=[comm.get_local_rank()], broadcast_buffers=False
+        )
 
-    output_config_path = os.path.join(cfg.OUTPUT_DIR, 'config.yml')
-    logger.info("Saving config into: {}".format(output_config_path))
-    # save overloaded model config in the output directory
-    save_config(cfg, output_config_path)
-
-    model = train(cfg, args.local_rank, args.distributed)
-
-    if not args.skip_test:
-        run_test(cfg, model, args.distributed)
+    do_train(cfg, model)
+    return do_test(cfg, model)
 
 
 if __name__ == "__main__":
-    main()
+    args = default_argument_parser().parse_args()
+    print("Command Line Args:", args)
+    launch(
+        main,
+        args.num_gpus,
+        num_machines=args.num_machines,
+        machine_rank=args.machine_rank,
+        dist_url=args.dist_url,
+        args=(args,),
+    )
