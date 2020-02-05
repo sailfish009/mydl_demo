@@ -11,12 +11,10 @@ cp -a mydl mydl_demo/
 
 cd mydl_demo/ 
 
-ln -s /some_dataset/train
-
-ln -s /some_dataset/test
+ln -s /some_dataset_path datasets
 
 fixed directory for mydl
 
-../train
-../test
+../datasets/train
+../datasets/test
 
